@@ -83,7 +83,8 @@ func NewMessageStore() (*MessageStore, error) {
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMP
+			last_message_time TIMESTAMP,
+			is_pinned BOOLEAN NOT NULL DEFAULT 0
 		);
 		
 		CREATE TABLE IF NOT EXISTS messages (
@@ -119,6 +120,7 @@ func NewMessageStore() (*MessageStore, error) {
 	// Existing installations have the original schema. Keep the migration
 	// additive so previously synced history remains intact.
 	_, _ = db.Exec("ALTER TABLE messages ADD COLUMN direct_path TEXT")
+	_, _ = db.Exec("ALTER TABLE chats ADD COLUMN is_pinned BOOLEAN NOT NULL DEFAULT 0")
 
 	return &MessageStore{db: db}, nil
 }
@@ -143,7 +145,8 @@ func (store *MessageStore) Close() error {
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET name = excluded.name, last_message_time = excluded.last_message_time`,
 		jid, name, lastMessageTime,
 	)
 	return err
@@ -260,20 +263,36 @@ func profileContactName(info types.ContactInfo, fallback string) string {
 }
 
 func resolveContactName(client *whatsmeow.Client, jid types.JID, fallback string) string {
+	name, _, _ := resolveContactDetails(client, jid, fallback)
+	return name
+}
+
+// resolveContactDetails keeps the local address-book name separate from a
+// WhatsApp profile name so the viewer can label each source honestly.
+func resolveContactDetails(client *whatsmeow.Client, jid types.JID, fallback string) (string, bool, string) {
 	ctx := context.Background()
 	candidates := []types.JID{jid}
+	phoneJID := types.EmptyJID
+	if jid.Server == types.DefaultUserServer {
+		phoneJID = jid
+	}
 	if jid.Server == types.HiddenUserServer {
 		if pn, err := client.Store.LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
 			// The phone JID carries the local contact-card name. It must be
 			// checked before the LID's own profile/push-name record.
 			candidates = []types.JID{pn, jid}
+			phoneJID = pn
 		}
+	}
+	phone := ""
+	if !phoneJID.IsEmpty() {
+		phone = "+" + phoneJID.User
 	}
 	// First pass: saved contact names across the phone and LID records.
 	for _, candidate := range candidates {
 		if contact, err := client.Store.Contacts.GetContact(ctx, candidate); err == nil {
-			if name := preferredContactName(contact, fallback); name != fallback {
-				return name
+			if name := preferredContactName(contact, ""); name != "" {
+				return name, true, phone
 			}
 		}
 	}
@@ -281,15 +300,15 @@ func resolveContactName(client *whatsmeow.Client, jid types.JID, fallback string
 	for _, candidate := range candidates {
 		if contact, err := client.Store.Contacts.GetContact(ctx, candidate); err == nil {
 			if name := profileContactName(contact, fallback); name != fallback {
-				return name
+				return name, false, phone
 			}
 		}
 	}
-	return fallback
+	return fallback, false, phone
 }
 
 func resolveIdentifierName(client *whatsmeow.Client, raw, fallback string) string {
-	if jid, err := types.ParseJID(raw); err == nil {
+	if jid, err := types.ParseJID(raw); err == nil && jid.Server != "" {
 		return resolveContactName(client, jid, fallback)
 	}
 	for _, server := range []string{types.DefaultUserServer, types.HiddenUserServer} {
@@ -345,8 +364,10 @@ func resolveGroupMentionNames(client *whatsmeow.Client, chatJID string) map[stri
 
 // SendMessageResponse represents the response for the send message API
 type SendMessageResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
+	Success   bool      `json:"success"`
+	Message   string    `json:"message"`
+	MessageID string    `json:"message_id,omitempty"`
+	Timestamp time.Time `json:"timestamp,omitempty"`
 }
 
 type ChatView struct {
@@ -356,7 +377,17 @@ type ChatView struct {
 	LastMessage     string    `json:"last_message"`
 	LastSender      string    `json:"last_sender"`
 	LastIsFromMe    bool      `json:"last_is_from_me"`
+	IsPinned        bool      `json:"is_pinned"`
+	IsGroup         bool      `json:"is_group"`
+	IsSavedContact  bool      `json:"is_saved_contact"`
+	HasAutoName     bool      `json:"has_auto_name"`
+	PhoneNumber     string    `json:"phone_number,omitempty"`
 	AvatarURL       string    `json:"avatar_url,omitempty"`
+}
+
+type PinChatRequest struct {
+	ChatJID string `json:"chat_jid"`
+	Pinned  bool   `json:"pinned"`
 }
 
 type MessageView struct {
@@ -380,15 +411,18 @@ type MentionView struct {
 
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
-	Recipient string `json:"recipient"`
-	Message   string `json:"message"`
-	MediaPath string `json:"media_path,omitempty"`
+	Recipient      string `json:"recipient"`
+	Message        string `json:"message"`
+	MediaPath      string `json:"media_path,omitempty"`
+	ReplyToID      string `json:"reply_to_id,omitempty"`
+	ReplyToSender  string `json:"reply_to_sender,omitempty"`
+	ReplyToContent string `json:"reply_to_content,omitempty"`
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, replyToID string, replyToSender string, replyToContent string) (bool, string, string, time.Time) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "Not connected to WhatsApp", "", time.Time{}
 	}
 
 	// Create JID for recipient
@@ -402,7 +436,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, fmt.Sprintf("Error parsing JID: %v", err), "", time.Time{}
 		}
 	} else {
 		// Create JID from phone number
@@ -419,7 +453,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, fmt.Sprintf("Error reading media file: %v", err), "", time.Time{}
 		}
 
 		// Determine media type and mime type based on file extension
@@ -468,7 +502,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, fmt.Sprintf("Error uploading media: %v", err), "", time.Time{}
 		}
 
 		fmt.Println("Media uploaded", resp)
@@ -498,7 +532,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), "", time.Time{}
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -540,18 +574,29 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileLength:    &resp.FileLength,
 			}
 		}
-	} else {
+	} else if replyToID == "" {
 		msg.Conversation = proto.String(message)
+	} else {
+		contextInfo := &waProto.ContextInfo{
+			StanzaID:      proto.String(replyToID),
+			RemoteJID:     proto.String(recipientJID.String()),
+			QuotedMessage: &waProto.Message{Conversation: proto.String(replyToContent)},
+		}
+		if recipientJID.Server == "g.us" && replyToSender != "" {
+			// Group events are stored using the participant's LID user value.
+			contextInfo.Participant = proto.String(types.NewJID(replyToSender, types.HiddenUserServer).String())
+		}
+		msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{Text: proto.String(message), ContextInfo: contextInfo}
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	response, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, fmt.Sprintf("Error sending message: %v", err), "", time.Time{}
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	return true, fmt.Sprintf("Message sent to %s", recipient), response.ID, response.Timestamp
 }
 
 // Extract media info from a message
@@ -896,11 +941,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 		rows, err := messageStore.db.Query(`
 			SELECT c.jid, COALESCE(c.name, ''), c.last_message_time,
-			       COALESCE(m.content, ''), COALESCE(m.sender, ''), COALESCE(m.is_from_me, 0)
+			       COALESCE(m.content, ''), COALESCE(m.sender, ''), COALESCE(m.is_from_me, 0), c.is_pinned
 			FROM chats c
 			LEFT JOIN messages m ON m.chat_jid = c.jid
 			  AND m.timestamp = (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.chat_jid = c.jid)
-			ORDER BY COALESCE(m.timestamp, c.last_message_time) DESC`)
+			ORDER BY c.is_pinned DESC, COALESCE(m.timestamp, c.last_message_time) DESC`)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -909,15 +954,18 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		chats := make([]ChatView, 0)
 		for rows.Next() {
 			var chat ChatView
-			if err := rows.Scan(&chat.JID, &chat.Name, &chat.LastMessageTime, &chat.LastMessage, &chat.LastSender, &chat.LastIsFromMe); err != nil {
+			if err := rows.Scan(&chat.JID, &chat.Name, &chat.LastMessageTime, &chat.LastMessage, &chat.LastSender, &chat.LastIsFromMe, &chat.IsPinned); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 			if jid, parseErr := types.ParseJID(chat.JID); parseErr == nil {
 				// History sync can carry a person's own display name as the chat title.
 				// For direct chats, always give the locally saved contact name priority.
-				if jid.Server != "g.us" {
-					chat.Name = resolveContactName(client, jid, chat.Name)
+				chat.IsGroup = jid.Server == "g.us"
+				if !chat.IsGroup {
+					chat.Name, chat.IsSavedContact, chat.PhoneNumber = resolveContactDetails(client, jid, chat.Name)
+					// A name that isn't from the saved address book is WhatsApp-provided.
+					chat.HasAutoName = !chat.IsSavedContact && chat.Name != "" && chat.Name != jid.User
 				}
 				chat.AvatarURL = "/api/avatar?jid=" + url.QueryEscape(chat.JID)
 			}
@@ -925,6 +973,30 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(chats)
+	})
+
+	http.HandleFunc("/api/chats/pin", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var request PinChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.ChatJID == "" {
+			http.Error(w, "chat_jid is required", http.StatusBadRequest)
+			return
+		}
+		result, err := messageStore.db.Exec("UPDATE chats SET is_pinned = ? WHERE jid = ?", request.Pinned, request.ChatJID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		count, _ := result.RowsAffected()
+		if count == 0 {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{"is_pinned": request.Pinned})
 	})
 
 	http.HandleFunc("/api/messages", func(w http.ResponseWriter, r *http.Request) {
@@ -954,7 +1026,14 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			message.SenderName = resolveIdentifierName(client, message.Sender, message.Sender)
+			// Group history often stores only the sender's LID. Prefer the current
+			// participant map, which connects that LID to the saved-contact or
+			// WhatsApp profile name before falling back to direct contact lookup.
+			senderID := strings.SplitN(message.Sender, "@", 2)[0]
+			message.SenderName = groupMentionNames[senderID]
+			if message.SenderName == "" {
+				message.SenderName = resolveIdentifierName(client, message.Sender, message.Sender)
+			}
 			mentionRows, mentionErr := messageStore.db.Query(
 				"SELECT mentioned_jid FROM message_mentions WHERE message_id = ? AND chat_jid = ?", message.ID, message.ChatJID)
 			if mentionErr == nil {
@@ -1051,8 +1130,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message, messageID, timestamp := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, req.ReplyToID, req.ReplyToSender, req.ReplyToContent)
 		fmt.Println("Message sent", success, message)
+		if success && req.Message != "" {
+			if err := messageStore.StoreMessage(messageID, req.Recipient, client.Store.ID.User, req.Message, timestamp, true, "", "", "", "", nil, nil, nil, 0); err != nil {
+				fmt.Printf("Failed to store sent message: %v\n", err)
+			}
+		}
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -1063,8 +1147,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		// Send response
 		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
+			Success:   success,
+			Message:   message,
+			MessageID: messageID,
+			Timestamp: timestamp,
 		})
 	})
 
