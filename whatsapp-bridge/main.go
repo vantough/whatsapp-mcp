@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -67,15 +68,32 @@ var groupMentionCache = struct {
 
 var contactDirectorySyncMu sync.Mutex
 
+func bridgeDataDir() string {
+	configured := strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_DATA_DIR"))
+	if configured == "" {
+		configured = "store"
+	}
+	absolute, err := filepath.Abs(configured)
+	if err != nil {
+		return configured
+	}
+	return absolute
+}
+
+func sqliteFileURL(path string) string {
+	return (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String()
+}
+
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	dataDir := bridgeDataDir()
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on&_busy_timeout=10000&_journal_mode=WAL")
+	db, err := sql.Open("sqlite3", sqliteFileURL(filepath.Join(dataDir, "messages.db"))+"?_foreign_keys=on&_busy_timeout=10000&_journal_mode=WAL")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -985,7 +1003,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	chatDir := filepath.Join(bridgeDataDir(), strings.ReplaceAll(chatJID, ":", "_"))
 	localPath := ""
 
 	// Get media info from the database
@@ -1100,6 +1118,28 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	http.HandleFunc("/api/logout", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.Header.Get("X-WhatsApp-Local-Action") != "logout" {
+			http.Error(w, "Missing required local logout header", http.StatusForbidden)
+			return
+		}
+		if !client.IsLoggedIn() {
+			http.Error(w, "This account is not logged in", http.StatusConflict)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+		if err := client.Logout(ctx); err != nil {
+			http.Error(w, "WhatsApp logout failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "logged_out", "data": "message and contact history retained"})
+	})
 	http.HandleFunc("/api/contacts", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1423,8 +1463,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	http.Handle("/", http.FileServer(http.Dir("../frontend")))
-	serverAddr := fmt.Sprintf(":%d", port)
+	frontendDir := strings.TrimSpace(os.Getenv("WHATSAPP_FRONTEND_DIR"))
+	if frontendDir == "" {
+		frontendDir = "../frontend"
+	}
+	http.Handle("/", http.FileServer(http.Dir(frontendDir)))
+	bindAddress := strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_BIND_ADDRESS"))
+	if bindAddress == "" {
+		bindAddress = "127.0.0.1"
+	}
+	serverAddr := fmt.Sprintf("%s:%d", bindAddress, port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -1440,16 +1488,27 @@ func main() {
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
 
+	bridgePort := 8080
+	if configuredPort := strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_PORT")); configuredPort != "" {
+		parsedPort, parseErr := strconv.Atoi(configuredPort)
+		if parseErr != nil || parsedPort < 1 || parsedPort > 65535 {
+			logger.Errorf("Invalid WHATSAPP_BRIDGE_PORT %q, expected an integer from 1 to 65535", configuredPort)
+			return
+		}
+		bridgePort = parsedPort
+	}
+
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	dataDir := bridgeDataDir()
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", sqliteFileURL(filepath.Join(dataDir, "whatsapp.db"))+"?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
@@ -1540,12 +1599,33 @@ func main() {
 		}
 
 		// Print QR code for pairing with phone
+		pairPhone := strings.TrimSpace(os.Getenv("WHATSAPP_PAIR_PHONE"))
+		pairDisplayName := strings.TrimSpace(os.Getenv("WHATSAPP_PAIR_DISPLAY_NAME"))
+		if pairDisplayName == "" {
+			pairDisplayName = "Chrome (Mac OS)"
+		}
+		pairCodeRequested := false
 		for evt := range qrChan {
 			if evt.Event == "code" {
+				if pairPhone != "" && !pairCodeRequested {
+					pairCodeRequested = true
+					pairCode, pairErr := client.PairPhone(context.Background(), pairPhone, true, whatsmeow.PairClientChrome, pairDisplayName)
+					if pairErr != nil {
+						logger.Errorf("Phone pairing code request failed: %v", pairErr)
+						client.Disconnect()
+						return
+					}
+					fmt.Printf("\nEnter this WhatsApp linked-device pairing code on your phone: %s\n", pairCode)
+					fmt.Println("Open WhatsApp on the phone number above, then Linked devices > Link a device > Link with phone number instead.")
+					continue
+				}
+				if pairCodeRequested {
+					continue
+				}
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 				if code, qrErr := qr.Encode(evt.Code, qr.M); qrErr == nil {
-					if file, fileErr := os.Create("store/login-qr.png"); fileErr == nil {
+					if file, fileErr := os.Create(filepath.Join(dataDir, "login-qr.png")); fileErr == nil {
 						src := code.Image()
 						dst := image.NewRGBA(image.Rect(0, 0, src.Bounds().Dx()*12, src.Bounds().Dy()*12))
 						for y := 0; y < src.Bounds().Dy(); y++ {
@@ -1597,7 +1677,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, bridgePort)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)

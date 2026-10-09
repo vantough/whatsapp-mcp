@@ -1,1 +1,2 @@
 shareable-kit/**/references/bridge-enhancements.patch whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+shareable-kit/**/assets/whatsapp-mcp-source/** whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab

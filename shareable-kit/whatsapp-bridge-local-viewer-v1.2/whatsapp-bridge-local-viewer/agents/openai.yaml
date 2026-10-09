@@ -1,0 +1,3 @@
+interface:
+  display_name: "WhatsApp Bridge Local Viewer"
+  short_description: "Set up the bundled WhatsApp bridge, optionally with viewer"

@@ -1,0 +1,10 @@
+{
+  "version": "1.2",
+  "mode": "ask-if-unspecified",
+  "install_directory": "~/Applications/WhatsAppMCP",
+  "bridge_port": 8080,
+  "autostart": true,
+  "enable_viewer": "ask-if-unspecified",
+  "configure_mcp_client": false,
+  "python_api_base_url": "http://127.0.0.1:8080/api"
+}

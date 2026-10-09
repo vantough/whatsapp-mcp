@@ -1,0 +1,4 @@
+interface:
+  display_name: "Local WhatsApp MCP"
+  short_description: "Set up and manage your local WhatsApp bridge"
+  default_prompt: "Set up my local WhatsApp MCP bridge. Ask whether I want backend only or the optional message viewer, then guide me through QR or phone-code pairing."

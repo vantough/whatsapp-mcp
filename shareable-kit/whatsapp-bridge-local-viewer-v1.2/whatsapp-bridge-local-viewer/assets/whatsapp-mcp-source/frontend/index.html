@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WhatsApp Stream</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="app-shell">
+    <aside class="sidebar">
+      <header class="sidebar-header"><div class="avatar self">W</div><div><strong>WhatsApp Stream</strong><span class="status"><i></i> bridge connected</span></div><button class="icon-button" id="refresh" aria-label="Refresh">↻</button></header>
+      <div class="search-wrap"><span>⌕</span><input id="chat-search" placeholder="Search or start new chat" /></div>
+      <div class="list-modes"><button type="button" id="show-chats" class="active">Chats</button><button type="button" id="show-contacts">Contacts</button><span id="directory-status">Local directory</span></div>
+      <div class="chat-list" id="chat-list"><div class="loading">Loading chats…</div></div>
+    </aside>
+    <section class="conversation">
+      <header class="conversation-header" id="conversation-header"><div class="empty-state"><div class="avatar">?</div><div><strong>Select a chat</strong><span>Choose a conversation to view its message stream</span></div></div></header>
+      <div class="message-canvas" id="message-canvas"><div class="welcome"><div class="welcome-mark">◌</div><h1>Your messages, locally</h1><p>Select a conversation to browse the synced stream from your WhatsApp bridge.</p></div></div>
+      <form class="composer" id="composer">
+        <div class="reply-preview" id="reply-preview" hidden><div><strong id="reply-author"></strong><span id="reply-content"></span></div><button type="button" id="cancel-reply" aria-label="Cancel reply" title="Cancel reply">×</button></div>
+        <div class="composer-row"><button type="button" class="attach" aria-label="Attach">＋</button><input id="message-input" autocomplete="off" placeholder="Type a message" disabled /><button type="submit" class="send-button" aria-label="Send" disabled>➤</button></div>
+      </form>
+    </section>
+  </main>
+  <dialog class="media-modal" id="media-modal" aria-label="Media preview">
+    <div class="media-modal-bar"><strong id="media-modal-name">Image</strong><div class="media-modal-actions"><button type="button" id="copy-image" title="Copy image to clipboard">⧉ Copy image</button><a id="download-media" download>⇩ Download</a><button type="button" id="close-media" aria-label="Close preview">×</button></div></div>
+    <div class="media-modal-stage"><img id="media-modal-image" alt="Expanded shared image" /></div>
+  </dialog>
+  <script src="app.js?v=20261009-local-contacts"></script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "version": "1.3",
+  "mode": "ask-if-unspecified",
+  "install_directory": "~/Applications/LocalWhatsAppMCP",
+  "enable_viewer": "ask-if-unspecified",
+  "bridge_port_start": 8080,
+  "autostart": true,
+  "configure_mcp_client": false,
+  "profile_directory": "~/Library/Application Support/LocalWhatsAppMCP/accounts",
+  "profiles": [],
+  "login_method": "qr",
+  "python_api_base_url": "http://127.0.0.1:8080/api",
+  "bind_address": "127.0.0.1"
+}
