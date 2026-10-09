@@ -65,6 +65,8 @@ var groupMentionCache = struct {
 	Entries map[string]groupMentionCacheEntry
 }{Entries: make(map[string]groupMentionCacheEntry)}
 
+var contactDirectorySyncMu sync.Mutex
+
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
@@ -73,7 +75,7 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on&_busy_timeout=10000&_journal_mode=WAL")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -112,6 +114,23 @@ func NewMessageStore() (*MessageStore, error) {
 			mentioned_jid TEXT NOT NULL,
 			PRIMARY KEY (message_id, chat_jid, mentioned_jid)
 		);
+
+		CREATE TABLE IF NOT EXISTS contact_directory (
+			contact_jid TEXT PRIMARY KEY,
+			phone_jid TEXT NOT NULL DEFAULT '',
+			saved_name TEXT NOT NULL DEFAULT '',
+			profile_name TEXT NOT NULL DEFAULT '',
+			business_name TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMP NOT NULL
+		);
+
+		CREATE TABLE IF NOT EXISTS contact_identities (
+			identity_jid TEXT PRIMARY KEY,
+			contact_jid TEXT NOT NULL,
+			phone_jid TEXT NOT NULL DEFAULT ''
+		);
+		CREATE INDEX IF NOT EXISTS contact_directory_phone_idx ON contact_directory(phone_jid);
+		CREATE INDEX IF NOT EXISTS contact_identities_contact_idx ON contact_identities(contact_jid);
 	`)
 	if err != nil {
 		db.Close()
@@ -123,6 +142,157 @@ func NewMessageStore() (*MessageStore, error) {
 	_, _ = db.Exec("ALTER TABLE chats ADD COLUMN is_pinned BOOLEAN NOT NULL DEFAULT 0")
 
 	return &MessageStore{db: db}, nil
+}
+
+type ContactDirectoryEntry struct {
+	JID          string   `json:"jid"`
+	Phone        string   `json:"phone"`
+	SavedName    string   `json:"saved_name"`
+	ProfileName  string   `json:"profile_name"`
+	BusinessName string   `json:"business_name"`
+	Name         string   `json:"name"`
+	IsSaved      bool     `json:"is_saved_contact"`
+	Identities   []string `json:"identities"`
+}
+
+func (store *MessageStore) UpsertContactDirectory(contactJID, phoneJID, savedName, profileName, businessName string, identities []string) error {
+	tx, err := store.db.Begin()
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`INSERT INTO contact_directory (contact_jid, phone_jid, saved_name, profile_name, business_name, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(contact_jid) DO UPDATE SET phone_jid=excluded.phone_jid, saved_name=excluded.saved_name,
+		profile_name=excluded.profile_name, business_name=excluded.business_name, updated_at=excluded.updated_at`,
+		contactJID, phoneJID, savedName, profileName, businessName, time.Now())
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for _, identity := range identities {
+		if identity == "" {
+			continue
+		}
+		if _, err = tx.Exec(`INSERT INTO contact_identities (identity_jid, contact_jid, phone_jid) VALUES (?, ?, ?)
+			ON CONFLICT(identity_jid) DO UPDATE SET contact_jid=excluded.contact_jid, phone_jid=excluded.phone_jid`, identity, contactJID, phoneJID); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (store *MessageStore) GetContactDirectory(query string, limit int) ([]ContactDirectoryEntry, error) {
+	if limit < 1 || limit > 500 {
+		limit = 100
+	}
+	pattern := "%" + strings.ToLower(strings.TrimSpace(query)) + "%"
+	rows, err := store.db.Query(`
+		SELECT c.contact_jid, c.phone_jid, c.saved_name, c.profile_name, c.business_name,
+			COALESCE((SELECT GROUP_CONCAT(i.identity_jid, char(10)) FROM contact_identities i WHERE i.contact_jid=c.contact_jid), c.contact_jid)
+		FROM contact_directory c
+		WHERE ? = '' OR lower(c.saved_name) LIKE ? OR lower(c.profile_name) LIKE ? OR lower(c.business_name) LIKE ?
+			OR lower(c.phone_jid) LIKE ? OR EXISTS (SELECT 1 FROM contact_identities i WHERE i.contact_jid=c.contact_jid AND lower(i.identity_jid) LIKE ?)
+		ORDER BY CASE WHEN c.saved_name <> '' THEN 0 ELSE 1 END, lower(CASE WHEN c.saved_name <> '' THEN c.saved_name WHEN c.business_name <> '' THEN c.business_name WHEN c.profile_name <> '' THEN c.profile_name ELSE c.contact_jid END)
+		LIMIT ?`, strings.TrimSpace(query), pattern, pattern, pattern, pattern, pattern, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	entries := make([]ContactDirectoryEntry, 0)
+	for rows.Next() {
+		var entry ContactDirectoryEntry
+		var phoneJID, identities string
+		if err := rows.Scan(&entry.JID, &phoneJID, &entry.SavedName, &entry.ProfileName, &entry.BusinessName, &identities); err != nil {
+			return nil, err
+		}
+		if phone, err := types.ParseJID(phoneJID); err == nil && !phone.IsEmpty() {
+			entry.Phone = "+" + phone.User
+		}
+		entry.IsSaved = entry.SavedName != ""
+		entry.Name = entry.SavedName
+		if entry.Name == "" {
+			entry.Name = entry.BusinessName
+		}
+		if entry.Name == "" {
+			entry.Name = entry.ProfileName
+		}
+		if entry.Name == "" {
+			entry.Name = entry.JID
+		}
+		for _, identity := range strings.Split(identities, "\n") {
+			if identity != "" {
+				entry.Identities = append(entry.Identities, identity)
+			}
+		}
+		entries = append(entries, entry)
+	}
+	return entries, rows.Err()
+}
+
+// syncContactDirectory snapshots WhatsApp's local contact store and direct chat
+// identities into the viewer's private SQLite database. No contact data leaves
+// this machine.
+func syncContactDirectory(client *whatsmeow.Client, store *MessageStore, logger waLog.Logger) {
+	contactDirectorySyncMu.Lock()
+	defer contactDirectorySyncMu.Unlock()
+	ctx := context.Background()
+	contacts, err := client.Store.Contacts.GetAllContacts(ctx)
+	if err != nil {
+		logger.Warnf("Could not sync WhatsApp contacts: %v", err)
+		return
+	}
+	seen := make(map[string]bool)
+	upsert := func(jid types.JID, info types.ContactInfo) {
+		if jid.IsEmpty() || jid.Server == types.GroupServer || jid.Server == types.BroadcastServer {
+			return
+		}
+		canonical, phone := jid, types.EmptyJID
+		if jid.Server == types.HiddenUserServer {
+			if pn, mapErr := client.Store.LIDs.GetPNForLID(ctx, jid); mapErr == nil && !pn.IsEmpty() {
+				canonical, phone = pn, pn
+			}
+		} else if jid.Server == types.DefaultUserServer {
+			phone = jid
+		}
+		key := canonical.String()
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		var aliases []string
+		aliases = append(aliases, canonical.String(), jid.String())
+		if !phone.IsEmpty() {
+			aliases = append(aliases, phone.String())
+			if lid, mapErr := client.Store.LIDs.GetLIDForPN(ctx, phone); mapErr == nil && !lid.IsEmpty() {
+				aliases = append(aliases, lid.String())
+			}
+		}
+		localName := preferredContactName(info, "")
+		profileName := profileContactName(info, "")
+		if err := store.UpsertContactDirectory(canonical.String(), phone.String(), localName, profileName, info.BusinessName, aliases); err != nil {
+			logger.Warnf("Could not save contact %s to local directory: %v", canonical, err)
+		}
+	}
+	for jid, info := range contacts {
+		upsert(jid, info)
+	}
+	// Include contacts present in the locally synced chat history even if the
+	// address-book snapshot has not yet included them.
+	rows, err := store.db.Query("SELECT jid FROM chats WHERE jid NOT LIKE '%@g.us' AND jid NOT LIKE '%@broadcast'")
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var raw string
+			if rows.Scan(&raw) == nil {
+				if jid, parseErr := types.ParseJID(raw); parseErr == nil {
+					info, _ := client.Store.Contacts.GetContact(ctx, jid)
+					upsert(jid, info)
+				}
+			}
+		}
+	}
+	logger.Infof("Local contact directory sync complete: %d identities", len(seen))
 }
 
 func (store *MessageStore) StoreMentions(messageID, chatJID string, mentionedJIDs []string) error {
@@ -228,6 +398,12 @@ func extractTextContent(msg *waProto.Message) string {
 		return text
 	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
 		return extendedText.GetText()
+	} else if poll := msg.GetPollCreationMessage(); poll != nil {
+		lines := []string{poll.GetName()}
+		for _, option := range poll.GetOptions() {
+			lines = append(lines, "• "+option.GetOptionName())
+		}
+		return strings.Join(lines, "\n")
 	}
 
 	// For now, we're ignoring non-text messages
@@ -411,16 +587,18 @@ type MentionView struct {
 
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
-	Recipient      string `json:"recipient"`
-	Message        string `json:"message"`
-	MediaPath      string `json:"media_path,omitempty"`
-	ReplyToID      string `json:"reply_to_id,omitempty"`
-	ReplyToSender  string `json:"reply_to_sender,omitempty"`
-	ReplyToContent string `json:"reply_to_content,omitempty"`
+	Recipient      string   `json:"recipient"`
+	Message        string   `json:"message"`
+	MediaPath      string   `json:"media_path,omitempty"`
+	ReplyToID      string   `json:"reply_to_id,omitempty"`
+	ReplyToSender  string   `json:"reply_to_sender,omitempty"`
+	ReplyToContent string   `json:"reply_to_content,omitempty"`
+	PollQuestion   string   `json:"poll_question,omitempty"`
+	PollOptions    []string `json:"poll_options,omitempty"`
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, replyToID string, replyToSender string, replyToContent string) (bool, string, string, time.Time) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, replyToID string, replyToSender string, replyToContent string, pollQuestion string, pollOptions []string) (bool, string, string, time.Time) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp", "", time.Time{}
 	}
@@ -447,9 +625,21 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	msg := &waProto.Message{}
+	if len(pollOptions) > 0 {
+		if pollQuestion == "" {
+			return false, "Poll question is required", "", time.Time{}
+		}
+		if len(pollOptions) < 2 {
+			return false, "A poll needs at least two options", "", time.Time{}
+		}
+		msg = client.BuildPollCreation(pollQuestion, pollOptions, 1)
+		mediaPath = ""
+	}
 
 	// Check if we have media to send
-	if mediaPath != "" {
+	if len(pollOptions) > 0 {
+		// Poll creation messages are already fully built above.
+	} else if mediaPath != "" {
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
@@ -603,6 +793,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, directPath string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
 	if msg == nil {
 		return "", "", "", "", nil, nil, nil, 0
+	}
+	if msg.GetPollCreationMessage() != nil {
+		return "poll", "", "", "", nil, nil, nil, 0
 	}
 
 	// Check for image message
@@ -907,6 +1100,21 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	http.HandleFunc("/api/contacts", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		contacts, err := messageStore.GetContactDirectory(r.URL.Query().Get("q"), 100)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(contacts)
+	})
+
 	http.HandleFunc("/api/avatar", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1122,7 +1330,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		if req.Message == "" && req.MediaPath == "" {
+		if req.Message == "" && req.MediaPath == "" && len(req.PollOptions) == 0 {
 			http.Error(w, "Message or media path is required", http.StatusBadRequest)
 			return
 		}
@@ -1130,10 +1338,19 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message, messageID, timestamp := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, req.ReplyToID, req.ReplyToSender, req.ReplyToContent)
+		success, message, messageID, timestamp := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, req.ReplyToID, req.ReplyToSender, req.ReplyToContent, req.PollQuestion, req.PollOptions)
 		fmt.Println("Message sent", success, message)
-		if success && req.Message != "" {
-			if err := messageStore.StoreMessage(messageID, req.Recipient, client.Store.ID.User, req.Message, timestamp, true, "", "", "", "", nil, nil, nil, 0); err != nil {
+		if success && (req.Message != "" || len(req.PollOptions) > 0) {
+			content := req.Message
+			mediaType := ""
+			if len(req.PollOptions) > 0 {
+				lines := []string{req.PollQuestion}
+				for _, option := range req.PollOptions {
+					lines = append(lines, "• "+option)
+				}
+				content, mediaType = strings.Join(lines, "\n"), "poll"
+			}
+			if err := messageStore.StoreMessage(messageID, req.Recipient, client.Store.ID.User, content, timestamp, true, mediaType, "", "", "", nil, nil, nil, 0); err != nil {
 				fmt.Printf("Failed to store sent message: %v\n", err)
 			}
 		}
@@ -1267,6 +1484,7 @@ func main() {
 	defer messageStore.Close()
 
 	// Setup event handling for messages and history sync
+	reconnectRequests := make(chan struct{}, 1)
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
@@ -1279,11 +1497,34 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			go syncContactDirectory(client, messageStore, logger)
+		case *events.Disconnected:
+			logger.Warnf("WhatsApp connection dropped; scheduling recovery")
+			select {
+			case reconnectRequests <- struct{}{}:
+			default:
+			}
+		case *events.KeepAliveTimeout:
+			logger.Warnf("WhatsApp keepalive timed out after %d errors; last success %s; scheduling recovery", v.ErrorCount, v.LastSuccess.Format(time.RFC3339))
+			select {
+			case reconnectRequests <- struct{}{}:
+			default:
+			}
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
 		}
 	})
+	go recoverWhatsAppConnection(client, reconnectRequests, logger)
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			if client.IsConnected() {
+				syncContactDirectory(client, messageStore, logger)
+			}
+		}
+	}()
 
 	// Create channel to track connection success
 	connected := make(chan bool, 1)
@@ -1370,6 +1611,76 @@ func main() {
 	fmt.Println("Disconnecting...")
 	// Disconnect client
 	client.Disconnect()
+}
+
+// recoverWhatsAppConnection forces a fresh socket after disconnect and keepalive
+// timeout events. Retry delays are capped so a long outage cannot leave the
+// client waiting for an unbounded backoff before trying again.
+func recoverWhatsAppConnection(client *whatsmeow.Client, requests <-chan struct{}, logger waLog.Logger) {
+	for range requests {
+		if client == nil || client.Store == nil || client.Store.ID == nil || client.Store.Deleted {
+			logger.Warnf("Skipping automatic reconnect because the WhatsApp session is unavailable")
+			continue
+		}
+
+		if client.IsConnected() {
+			logger.Warnf("Forcing WhatsApp reconnect after a keepalive timeout")
+			client.Disconnect()
+		}
+
+		delay := 2 * time.Second
+		for {
+			if client.IsLoggedIn() && client.IsConnected() {
+				logger.Infof("WhatsApp connection recovery completed")
+				break
+			}
+			if client.Store.Deleted {
+				logger.Errorf("Stopping automatic reconnect because the WhatsApp session was logged out")
+				break
+			}
+
+			if !client.IsConnected() {
+				if err := client.Connect(); err != nil {
+					logger.Errorf("WhatsApp reconnect attempt failed: %v; retrying in %s", err, delay)
+					select {
+					case <-time.After(delay):
+					case <-requests:
+					}
+					if delay < time.Minute {
+						delay *= 2
+						if delay > time.Minute {
+							delay = time.Minute
+						}
+					}
+					continue
+				}
+			}
+
+			// Connect returns after opening the socket, before WhatsApp auth completes.
+			deadline := time.Now().Add(30 * time.Second)
+			for time.Now().Before(deadline) && client.IsConnected() && !client.IsLoggedIn() {
+				time.Sleep(time.Second)
+			}
+			if client.IsLoggedIn() && client.IsConnected() {
+				logger.Infof("WhatsApp connection recovery completed")
+				break
+			}
+			logger.Warnf("WhatsApp reconnect did not authenticate; retrying in %s", delay)
+			if client.IsConnected() {
+				client.Disconnect()
+			}
+			select {
+			case <-time.After(delay):
+			case <-requests:
+			}
+			if delay < time.Minute {
+				delay *= 2
+				if delay > time.Minute {
+					delay = time.Minute
+				}
+			}
+		}
+	}
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
